@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(access.guard)])
 VERSION = "0.1.0"
 INBOX_TITLE = "Domo inbox"
+DOMO_SOURCE = "api_server"   # Hermes's source for sessions started through its API server, i.e. by Domo
 RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
 
 _stores: dict[str, Store] = {}
@@ -579,12 +580,15 @@ def search_status(profile: str = Query(bridge.DEFAULT, alias="agent")):
 
 @router.get("/sessions")
 async def sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(30, ge=1, le=200),
-                   archived: bool = False):
+                   archived: bool = False, all_sources: bool = Query(False, alias="all")):
+    """Domo's chats: the ones started through the API server, not the agent's Slack, cron or
+    terminal sessions. ``all=true`` lists every source."""
     store = _store(profile)
     if archived:
         listing = {"object": "list", "data": await _archived_sessions(profile, store)}
     else:
-        listing = await _passthrough(profile, "GET", "/api/sessions", params={"limit": limit})
+        params = {"limit": limit} if all_sources else {"limit": limit, "source": DOMO_SOURCE}
+        listing = await _passthrough(profile, "GET", "/api/sessions", params=params)
     chat_tags = store.tag_map("session")
     for row in _rows(listing, "data", "sessions"):
         row.update(_tagged(chat_tags.get(row.get("id"), [])))
