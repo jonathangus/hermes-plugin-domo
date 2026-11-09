@@ -61,6 +61,10 @@ Start the gateway (`hermes gateway run`) and the dashboard (`hermes dashboard --
 
 Optional per profile: `plugin-data/domo/profile.json` (`display_name`, `kind`, `spaces`) for display names and starting spaces; `DOMO_SPACES` (comma-separated) in the profile's `.env`.
 
+## As a second Hermes beside another
+
+A Hermes with this plugin can join another Domo (a work computer beside the home Mac): run it as above, then, in the Domo people already use, Settings ▸ Connect another Hermes with this dashboard's Tailscale address and sign-in. That Domo's plugin relays to this one: agents here show there as `<profile>@<name>`, and every route works for them. This dashboard must be reachable from the other machine over Tailscale (`--host 0.0.0.0`). A profile whose `display_name` matches the person's name there is picked as theirs and called by the connection's name ("Work"). The routes behind it: `GET`/`POST /connections`, `POST /connections/probe`, `PATCH`/`DELETE /connections/{id}`.
+
 ## Optional extras
 
 - Search by meaning: any OpenAI-compatible embeddings endpoint (`DOMO_EMBED_URL`, `DOMO_EMBED_MODEL`, `DOMO_EMBED_KEY`), e.g. Ollama with `embeddinggemma-2:270m`. Without it search matches words only.

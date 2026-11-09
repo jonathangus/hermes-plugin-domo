@@ -18,16 +18,32 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, local, memory, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
+from domo import access, bridge, filing, files as attach, local, memory, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
-router = APIRouter(dependencies=[Depends(access.guard)])
+
+
+class _Relayed(APIRoute):
+    """A request naming an agent on another Hermes (`jonathan@work`) goes to that Hermes, whichever route it is."""
+
+    def get_route_handler(self):
+        here = super().get_route_handler()
+
+        async def handler(request: Request) -> Response:
+            agent = request.query_params.get("agent") or ""
+            return await (remotes.relay(request, agent) if remotes.split(agent) else here(request))
+
+        return handler
+
+
+router = APIRouter(route_class=_Relayed, dependencies=[Depends(access.guard)])
 VERSION = "0.1.0"
 INBOX_TITLE = "Domo inbox"
 RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
@@ -133,9 +149,97 @@ def versions():
 
 
 @router.get("/profiles")
-def profiles(request: Request):
+async def profiles(request: Request):
     allowed = access.allowed_profiles(request)
-    return {"profiles": [bridge.profile_info(n) for n in bridge.profile_names() if allowed is None or n in allowed]}
+    here = [bridge.profile_info(n) for n in bridge.profile_names() if allowed is None or n in allowed]
+    return {"profiles": here + remotes.listed(allowed)}
+
+
+# ---- other Hermes installs --------------------------------------------------------------------
+
+class RemoteIn(BaseModel):
+    name: str = Field(min_length=1, max_length=40)
+    url: str = Field(pattern=r"^https?://")
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
+
+
+class RemoteNew(RemoteIn):
+    owner: str            # the profile on this Mac whose person this connection is for
+    agents: list[str]     # which of that Hermes's profiles are theirs
+
+
+class RemotePatch(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=40)
+    enabled: bool | None = None
+    agents: list[str] | None = None
+
+
+def _own_remote(request: Request, remote_id: str) -> dict:
+    remote = remotes.find(remote_id)
+    if not remote or not remotes.may_see(remote, access.allowed_profiles(request)):
+        raise HTTPException(404, "No such connection")
+    return remote
+
+
+async def _probe(body: RemoteIn) -> list[dict]:
+    try:
+        return await remotes.probe(body.name, body.url.rstrip("/"), body.username, body.password)
+    except remotes.RemoteError as exc:
+        raise HTTPException(422 if exc.status == 401 else 502, exc.detail)  # never 401: that signs the app out here
+
+
+@router.get("/connections")
+def connections(request: Request):
+    allowed = access.allowed_profiles(request)
+    return {"connections": [remotes.public(r) for r in remotes.load() if remotes.may_see(r, allowed)]}
+
+
+@router.post("/connections/probe")
+async def probe_connection(body: RemoteIn):
+    """Signs in to the other dashboard and lists its profiles, to choose yours from."""
+    return {"agents": await _probe(body)}
+
+
+@router.post("/connections")
+async def add_connection(body: RemoteNew, request: Request):
+    allowed = access.allowed_profiles(request)
+    owner = body.owner.lower()
+    if owner not in bridge.profile_names() or (allowed is not None and owner not in allowed):
+        raise HTTPException(403, "This sign-in can't add a connection for that profile")
+    found = {a["id"]: a for a in await _probe(body)}
+    chosen = [found[a] for a in dict.fromkeys(body.agents) if a in found]
+    if not chosen:
+        raise HTTPException(422, "Choose at least one of its agents")
+    saved = remotes.load()
+    remote = {"id": remotes.slug(body.name, {r["id"] for r in saved}), "name": body.name.strip(), "url": body.url.rstrip("/"),
+              "username": body.username, "password": body.password, "owner": owner, "enabled": True,
+              "agents": chosen, "refreshed_at": datetime.now().timestamp()}
+    remotes.save(saved + [remote])
+    return remotes.public(remote)
+
+
+@router.patch("/connections/{remote_id}")
+async def patch_connection(remote_id: str, body: RemotePatch, request: Request):
+    remote = _own_remote(request, remote_id)
+    if body.agents is not None:
+        found = {a["id"]: a for a in await remotes.probe(remote["name"], remote["url"], remote["username"], remote["password"])} if body.agents else {}
+        remote["agents"] = [found[a] for a in dict.fromkeys(body.agents) if a in found]
+    if body.name is not None:
+        remote["name"] = body.name.strip()
+    if body.enabled is not None:
+        remote["enabled"] = body.enabled
+    remotes.save([remote if r["id"] == remote_id else r for r in remotes.load()])
+    remotes.forget_client(remote_id)
+    return remotes.public(remote)
+
+
+@router.delete("/connections/{remote_id}")
+def delete_connection(remote_id: str, request: Request):
+    _own_remote(request, remote_id)
+    remotes.save([r for r in remotes.load() if r["id"] != remote_id])
+    remotes.forget_client(remote_id)
+    return {"ok": True}
 
 
 # ---- Domo items -------------------------------------------------------------------------------

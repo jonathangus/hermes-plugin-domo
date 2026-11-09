@@ -17,6 +17,7 @@ from fastapi import HTTPException, Request
 CLAIM = "domo_profiles"
 SSO_PROVIDER = "self-hosted"
 FILTERED = ("/profiles", "/health")
+OWN_CHECKS = "/connections"  # each connection is checked against its owner
 
 
 def _claims(token: str) -> dict:
@@ -42,7 +43,8 @@ def allowed_profiles(request: Request) -> Optional[set[str]]:
 def guard(request: Request) -> None:
     """Router dependency: every route names its profile as ?agent=, defaulting to the family's."""
     allowed = allowed_profiles(request)
-    if allowed is None or request.url.path.rstrip("/").endswith(FILTERED):  # those two list only what you may open
+    path = request.url.path.rstrip("/")
+    if allowed is None or path.endswith(FILTERED) or OWN_CHECKS in path:  # those list only what you may open
         return
     from domo import bridge  # late: this module is imported by the plugin's package init order
 
