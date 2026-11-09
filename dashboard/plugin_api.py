@@ -23,7 +23,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, memory, repos as repo_scan, rtk, search as chat_search, stitch, suggest  # noqa: E402
+from domo import access, bridge, filing, files as attach, local, memory, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -471,6 +471,69 @@ async def _kick_off(profile: str, run_id: str, session_id: str, repo: dict, prom
         store.run_finish(run_id, ok=False, note=f"The agent didn't start: {type(exc).__name__}")
 
 
+# ---- sessions on the person's other machines (Domo Link, apps/link) ----------------------------
+
+def _local(profile: str) -> local.LocalStore:
+    home = _home(profile)
+    work.watch(home)
+    return local.store_for(home)
+
+
+@router.post("/local/sync")
+async def local_sync(request: Request, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Link's push: what the machine runs now, new transcript bytes, hook events. Idempotent (domo/local.py)."""
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(400, "expected JSON")
+    store = _local(profile)
+    try:
+        return await asyncio.to_thread(store.ingest, body)
+    except local.LocalError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@router.get("/local/machines")
+def local_machines(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return {"machines": _local(profile).machines()}
+
+
+@router.get("/local/sessions")
+async def local_sessions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(50, ge=1, le=200),
+                         machine: Optional[str] = None):
+    """Claude Code and Cursor sessions from Link, what needs the person first, then running, then newest."""
+    store = _local(profile)
+    sessions = await asyncio.to_thread(store.sessions, limit=limit, machine=machine)
+    return {"sessions": sessions, "machines": store.machines()}
+
+
+@router.get("/local/sessions/{session_id}")
+async def local_session(session_id: str, profile: str = Query(bridge.DEFAULT, alias="agent"),
+                        revision: Optional[int] = None):
+    """One session's messages, in the chat's Message shape. Pass the last revision to poll cheaply."""
+    store = _local(profile)
+    if revision is not None and store.revision(session_id) == revision:
+        return {"unchanged": True, "revision": revision, "session": await asyncio.to_thread(store.session, session_id)}
+    found = await asyncio.to_thread(store.messages, session_id)
+    if found is None:
+        raise HTTPException(404, f"no local session {session_id!r}")
+    return found
+
+
+@router.get("/local/work")
+async def local_work(profile: str = Query(bridge.DEFAULT, alias="agent"), days: float = Query(3, gt=0, le=60)):
+    """Pieces of work (threads of sessions) with their digests, newest first."""
+    return {"threads": await asyncio.to_thread(work.recent, _local(profile), days=days)}
+
+
+@router.get("/local/work/{thread_id}")
+async def local_thread(thread_id: str, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    found = await asyncio.to_thread(work.thread, _local(profile), thread_id)
+    if found is None:
+        raise HTTPException(404, f"no thread {thread_id!r}")
+    return found
+
+
 # ---- chat, sessions and routines (passed through to the API server) ----------------------------
 
 @router.get("/search")
@@ -485,6 +548,9 @@ async def search(q: str = "", profile: str = Query(bridge.DEFAULT, alias="agent"
     chat_tags = store.tag_map("session")
     for row in found["results"]:
         row.update({k: v for k, v in _tagged(chat_tags.get(row["session_id"], [])).items() if k in ("space_id", "tags")})
+    # sessions from the other machines, by their words, beside the chats (only where Link has sent any)
+    if not space_id and local.db_path(_home(profile)).exists():
+        found["local"] = await asyncio.to_thread(_local(profile).search, q, limit=min(limit, 10))
     return found
 
 

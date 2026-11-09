@@ -235,6 +235,35 @@ def domo_shared(args: dict, session_id: str) -> str:
     return _fail("action must be list, read, append or write")
 
 
+@_guard
+def domo_work(args: dict, session_id: str) -> str:
+    """Work done on the person's other machines, from Domo Link: by Claude Code or Cursor there, not by you."""
+    from . import local, work
+    home = current_home()
+    if not local.db_path(home).exists():
+        return _fail("no other machine is connected: Domo Link isn't set up on one yet")
+    store = local.store_for(home)
+    action = args.get("action") or "recent"
+    if action == "recent":
+        return _ok(threads=work.recent(store, days=float(args.get("days") or 3), limit=int(args.get("limit") or 20)),
+                   machines=store.machines())
+    if action == "day":
+        return _ok(**work.day(store, str(args.get("date") or "")))
+    if action == "search":
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return _fail("search needs a query")
+        return _ok(sessions=[{k: s[k] for k in ("id", "title", "repo", "branch", "machine_name", "last_active", "snippet", "thread_id")}
+                             for s in store.search(query, limit=int(args.get("limit") or 10))])
+    if action == "thread":
+        found = work.thread(store, str(args.get("id") or ""))
+        return _ok(thread=found) if found else _fail("no thread with that id")
+    if action == "running":
+        return _ok(sessions=[s for s in store.sessions(limit=50) if s["status"] in ("working", "waiting", "idle")],
+                   machines=store.machines())
+    return _fail("action is recent, day, search, thread or running")
+
+
 # ---- schemas ----------------------------------------------------------------------------------
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
@@ -317,6 +346,16 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
          "expires_hours": {"type": "number", "description": "When it stops being worth showing (default 36)"},
          "space": _SPACE},
         ["title", "prompt"]), domo_suggest, "💡"),
+    ("domo_work", _schema(
+        "domo_work",
+        "What the person did on their other machines (Claude Code and Cursor on the MacBook), as pieces of work with"
+        " a summary, commits and PRs. This was their coding agent there, not you: say so ('on your MacBook, Claude Code…')."
+        " recent: the last days' work. day: one day by repo (date YYYY-MM-DD, default today). search: sessions by words."
+        " thread: one piece of work in full, with its transcript. running: sessions open there right now.",
+        {"action": {"type": "string", "enum": ["recent", "day", "search", "thread", "running"]},
+         "days": {"type": "number"}, "date": _S, "query": _S, "id": {"type": "string", "description": "thread: its id"},
+         "limit": {"type": "number"}},
+        ["action"]), domo_work, "💻"),
     ("domo_open", _schema(
         "domo_open", "List open decisions, to-dos and runs, to avoid asking twice.",
         {"kind": {"type": "string", "enum": ["decision", "todo", "run"]}}, []), domo_open, "📋"),
@@ -329,6 +368,7 @@ PROMPT = (
     "- After you act, domo_receipt with proof and how to undo.\n"
     "- Facts people ask for again: domo_fact.\n"
     "- Check domo_open before asking something you may already have asked.\n"
+    "- Their work on other machines (Claude Code, Cursor on the MacBook): domo_work.\n"
     "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"    "- Reports, digests and replies with posts, numbers or screenshots: follow the domo-rich-reports skill.\n"
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
     " leave it with domo_suggest instead of saying 'let me know'."
