@@ -15,7 +15,11 @@ Domo app ─▶ Hermes dashboard :9119 (login) ─ /api/plugins/domo/* ─▶ th
 
 ## Install
 
-The plugin must live in a directory named `domo` (its routes import `domo` as a package).
+```bash
+hermes plugins install jonathangus/hermes-plugin-domo --enable
+```
+
+That puts it in `~/.hermes/plugins/domo`. By hand it works too, but the directory must be named `domo` (its routes import `domo` as a package):
 
 ```bash
 git clone https://github.com/jonathangus/hermes-plugin-domo ~/.hermes/plugins/domo
