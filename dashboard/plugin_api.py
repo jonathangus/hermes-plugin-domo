@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, local, memory, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
+from domo import access, bridge, filing, files as attach, local, memory, minne, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -1071,7 +1071,7 @@ async def upload_recording(request: Request, background: BackgroundTasks, id: st
         "id": id, "title": rec_title, "note": " ".join(note.split())[:500], "duration": duration, "started_at": started,
         "created_at": time.time(), "session_id": session_id or "", "hold": hold, "audio": str(path), "path": str(path),
         "name": display, "mime": mime, "size": size, "status": "saved", "progress": 0.0, "error": "",
-        "engine": recordings.engine(recordings.settings()),
+        "engine": "minne" if _minne_sends(home) else recordings.engine(recordings.settings()),
     })
     background.add_task(_transcribe if hold else _hand_over, profile, id)
     return rec
@@ -1098,6 +1098,12 @@ def _resume_recording(background: BackgroundTasks, profile: str, rec: dict) -> N
     """One the dashboard stopped in the middle of (a restart) carries on when it's next asked about."""
     if rec.get("status") in recordings.OPEN and (profile, rec["id"]) not in _RECORDING:
         background.add_task(_transcribe if rec.get("hold") else _hand_over, profile, rec["id"])
+
+
+def _minne_sends(home: Path) -> str:
+    """The profile's own Minne key, when it's a person's: recordings go to their Minne."""
+    key = minne.key(home)
+    return key if minne.kind(key) == "person" else ""
 
 
 async def _recording_chat(profile: str, title: str, rec_id: str) -> str:
@@ -1131,12 +1137,15 @@ async def _transcribe(profile: str, rec_id: str) -> Optional[dict]:
                 shown[0] = p
                 recordings.update(home, rec_id, progress=round(p, 3))
 
-        t = await asyncio.to_thread(recordings.transcribe, Path(rec["audio"]), progress)
+        # with the person's own Minne key it goes to their Minne, a meeting beside the rest; else the Mac hears it
+        t = await asyncio.to_thread(recordings.transcribe, Path(rec["audio"]), progress, minne_key=_minne_sends(home),
+                                    started_at=rec.get("started_at") or 0, duration=rec.get("duration") or 0, mime=rec.get("mime") or "")
         if not t["text"].strip():
             raise recordings.TranscriptionError("No speech in the recording")
         recordings.save_words(home, rec_id, t)
         recordings.update(home, rec_id, status="transcribed", progress=1.0, engine=t["engine"], model=t["model"],
-                          language=t["language"], words=len(t["text"].split()))
+                          language=t["language"], words=len(t["text"].split()), minne_meeting=t.get("meeting_id", ""),
+                          minne_missed=t.get("minne_missed", ""))
         return t
     except Exception as exc:
         log.exception("recording %s for %s", rec_id, profile)
@@ -1177,7 +1186,7 @@ def _attached_transcript(profile: str, store: Store, rec_id: str, session_id: st
                       "Say so in a line, and that sending it again tries again.")
     md, saved = _save_transcript(home, store, rec, t, session_id)
     recordings.update(home, rec_id, status="done", session_id=session_id, transcript=saved["path"])
-    return attach.describe(home, saved["path"]), recordings.guidance(md, attached=True)
+    return attach.describe(home, saved["path"]), recordings.guidance(md, attached=True, speakers=recordings.named(t))
 
 
 async def _hand_over(profile: str, rec_id: str) -> None:
@@ -1194,7 +1203,7 @@ async def _hand_over(profile: str, rec_id: str) -> None:
         rec = recordings.get(home, rec_id)
         md, saved = _save_transcript(home, store, rec, t, session_id)
         rec = recordings.update(home, rec_id, status="thinking", transcript=saved["path"])
-        said, ask = recordings.turn(rec, md)
+        said, ask = recordings.turn(rec, md, speakers=recordings.named(t))
         found = [f for f in (attach.describe(home, rec["audio"]), attach.describe(home, saved["path"])) if f]
         instructions = [x for x in (_tag_context(store, session_id), memory.for_prompt(store)) if x] + [ask]
         payload = {"message": attach.compose(said, found), "instructions": "\n\n".join(instructions)}

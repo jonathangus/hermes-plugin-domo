@@ -71,7 +71,7 @@ A Hermes with this plugin can join another Domo (a work computer beside the home
 - Auto-filing chats into spaces: `TYPESAFE_API_KEY`. Without it chats stay where you put them.
 - `rtk` on PATH: compresses terminal output before it reaches the model.
 - `DOMO_REPO_ROOTS`: colon-separated folders the app scans for git repos.
-- An organisation's meetings in [Minne](https://useminne.com/developers/): its key (`MINNE_KEY=minne_sk_…`, made by an admin on the organisation's page in Minne) in a profile's own `.env` gives that profile's agent a read-only `minne` tool: search, list, a meeting's summary and who spoke, its transcript. Only that profile: a key never crosses to another. Restart the gateway after adding it. For a person's own meetings, connect Minne's MCP server with their sign-in instead: `hermes mcp add minne --url https://api.useminne.com/mcp --auth oauth`.
+- Meetings in [Minne](https://useminne.com/developers/): a key in a profile's own `.env` (`MINNE_KEY`) gives that profile's agent a `minne` tool: search, list, a meeting's summary and who spoke, its transcript. An organisation's key (`minne_sk_…`, made by an admin) reads what its people shared, nothing of anyone's own; a person's own key (`minne_pk_…`, their account page) reads their meetings and their organisation's shared ones, and the app's recordings go to their Minne to be transcribed, with who spoke. Only that profile: a key never crosses to another. Restart the gateway after adding it.
 
 ## Compatibility
 

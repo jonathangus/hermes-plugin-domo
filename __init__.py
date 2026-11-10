@@ -15,11 +15,12 @@ def register(ctx):
         ctx.register_tool(name=name, toolset="domo", schema=schema, handler=handler,
                           description=schema["description"], emoji=emoji)
     ctx.register_system_prompt_section("domo.chief-of-staff", PROMPT, max_chars=1200)
-    # an organisation's Minne key in this profile's .env (the work computer's): its shared meetings, as a tool
-    if minne.key(home):
-        (name, schema, handler, _), = bound_tools(home, [("minne", minne.SCHEMA, tools.domo_minne, "🎙️")])
+    # a Minne key in this profile's .env: a person's own (their meetings) or an organisation's (what's shared)
+    whose = minne.kind(minne.key(home))
+    if whose:
+        (name, schema, handler, _), = bound_tools(home, [("minne", minne.schema(whose), tools.domo_minne, "🎙️")])
         ctx.register_tool(name=name, toolset="domo", schema=schema, handler=handler, description=schema["description"], emoji="🎙️")
-        ctx.register_system_prompt_section("domo.minne", minne.PROMPT, max_chars=400)
+        ctx.register_system_prompt_section("domo.minne", minne.prompt(whose), max_chars=400)
     if rtk.available():
         ctx.register_hook("pre_tool_call", rtk.pre_tool_call)
     if with_shared:
