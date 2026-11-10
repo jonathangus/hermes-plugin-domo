@@ -47,6 +47,9 @@ class _Relayed(APIRoute):
 
 router = APIRouter(route_class=_Relayed, dependencies=[Depends(access.guard)])
 VERSION = "0.1.0"
+# What this plugin's routes can do beyond the basics. An agent on another Hermes lists that one's, so the
+# apps offer each only where it works: an older plugin there lists none, and nothing changes for it.
+FEATURES = ["snooze", "steer", "keep_moving", "plan_usage", "promises"]
 INBOX_TITLE = "Domo inbox"
 DOMO_SOURCE = "api_server"   # Hermes's source for sessions started through its API server, i.e. by Domo
 RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
@@ -154,7 +157,7 @@ def versions():
 @router.get("/profiles")
 async def profiles(request: Request):
     allowed = access.allowed_profiles(request)
-    here = [bridge.profile_info(n) for n in bridge.profile_names() if allowed is None or n in allowed]
+    here = [{**bridge.profile_info(n), "features": FEATURES} for n in bridge.profile_names() if allowed is None or n in allowed]
     return {"profiles": here + remotes.listed(allowed)}
 
 
