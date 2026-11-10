@@ -107,6 +107,10 @@ CREATE TABLE IF NOT EXISTS suggestion_votes (
     at       REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS suggestion_votes_key ON suggestion_votes(key);
+CREATE TABLE IF NOT EXISTS suggestion_snoozes (
+    key    TEXT PRIMARY KEY,
+    until  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS archived_sessions (
     session_id   TEXT PRIMARY KEY,
     archived_at  REAL NOT NULL
@@ -141,7 +145,7 @@ CREATE TABLE IF NOT EXISTS files (
 );
 """
 
-SPACE_FIELDS = ("id", "name", "icon", "color", "description", "prompt", "created_at", "updated_at", "parent_id", "origin", "kind", "quiet")
+SPACE_FIELDS = ("id", "name", "icon", "color", "description", "prompt", "created_at", "updated_at", "parent_id", "origin", "kind", "quiet", "keep_moving")
 KINDS_OF_SPACE = ("area", "topic")
 TARGETS = ("session", "file", "job", "item")
 PALETTE = ("#4CC9F0", "#FF6B2C", "#3DD68C", "#FF2D8A", "#FFB020", "#2F5BFF")   # the brand spectrum (docs/BRAND.md §3.2)
@@ -260,6 +264,8 @@ class Store:
             "ALTER TABLE spaces ADD COLUMN kind TEXT NOT NULL DEFAULT 'area'",
             "ALTER TABLE spaces ADD COLUMN quiet INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE spaces ADD COLUMN aliases TEXT NOT NULL DEFAULT '[]'",
+            # a space Domo checks in on by itself, to keep its work moving (checkin.py)
+            "ALTER TABLE spaces ADD COLUMN keep_moving INTEGER NOT NULL DEFAULT 0",
         ):
             try:
                 self._db.execute(sql)
@@ -634,6 +640,8 @@ class Store:
         if not current:
             raise StoreError(f"no space {space_id!r}")
         patch = {k: v for k, v in fields.items() if v is not None and k in SPACE_FIELDS[1:6]}
+        if fields.get("keep_moving") is not None:
+            patch["keep_moving"] = int(bool(fields["keep_moving"]))
         if "name" in patch:
             patch["name"] = " ".join(patch["name"].split())
             if not patch["name"]:
@@ -834,7 +842,15 @@ class Store:
         """Done is done; a dismissal lasts a week, then the thing may come back if it's still true."""
         now = self._clock()
         rows = self._db.execute("SELECT key, verdict, MAX(at) FROM suggestion_votes WHERE verdict IN ('done', 'dismiss') GROUP BY key, verdict")
-        return {k for k, v, at in rows if v == "done" or now - at < dismissed_for}
+        snoozed = self._db.execute("SELECT key FROM suggestion_snoozes WHERE until > ?", (now,))
+        return {k for k, v, at in rows if v == "done" or now - at < dismissed_for} | {r[0] for r in snoozed}
+
+    def snooze(self, key: str, until: float) -> None:
+        """Put a suggestion away until a moment; it comes back then if it's still true. It doesn't tune its kind."""
+        if until <= self._clock():
+            raise StoreError("snooze until a moment still to come")
+        with self._tx() as db:
+            db.execute("INSERT OR REPLACE INTO suggestion_snoozes (key, until) VALUES (?, ?)", (key, until))
 
     def kind_weights(self) -> dict[str, float]:
         """More like this lifts a kind, less like this lowers it; dismissals nudge it down."""
@@ -973,7 +989,7 @@ def _row(row: sqlite3.Row) -> dict:
 
 
 def _space(row: sqlite3.Row) -> dict:
-    return {k: row[k] for k in SPACE_FIELDS}
+    return {**{k: row[k] for k in SPACE_FIELDS}, "keep_moving": bool(row["keep_moving"])}
 
 
 def _slug(name: str) -> str:

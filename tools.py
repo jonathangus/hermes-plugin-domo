@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from . import shared
+from . import shared, suggest
 from .store import Store, StoreError, store_path
 
 log = logging.getLogger(__name__)
@@ -112,8 +112,11 @@ def domo_todo(args: dict, session_id: str) -> str:
     owner = args.get("owner", "me")
     if owner not in ("me", "domo"):
         return _fail("owner is 'me' or 'domo'")
-    item = store.create("todo", args.get("title", ""), body=args.get("body", ""), space=args.get("space", ""),
-                        session_id=session_id, data={"owner": owner, "due": args.get("due", "")})
+    due = str(args.get("due") or "").strip()
+    if due and suggest.due_at(due) is None:
+        return _fail("due is a local ISO date or date-time, like 2026-11-13 or 2026-11-13T17:00: work 'Friday' out from today")
+    item = store.create("todo", args.get("title", ""), body=args.get("body", ""), space=args.get("space", ""), session_id=session_id,
+                        data={"owner": owner, "due": due, **({"who": str(args["who"]).strip()} if str(args.get("who") or "").strip() else {})})
     return _ok(todo=_brief_item(item))
 
 
@@ -301,9 +304,13 @@ TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
          "space": _SPACE},
         ["title", "options"]), domo_ask, "🙋"),
     ("domo_todo", _schema(
-        "domo_todo", "Add a to-do (owner 'me' for the person, 'domo' for work you will do once approved) or mark one done.",
-        {"action": {"type": "string", "enum": ["add", "done"]}, "title": _S, "body": _S,
-         "owner": {"type": "string", "enum": ["me", "domo"]}, "due": _S,
+        "domo_todo", "Add a to-do (owner 'me' for the person, 'domo' for work you will do once approved) or mark one done."
+        " A promise with a time ('I'll send it Friday') is a to-do with due: it comes up in Next up when due.",
+        {"action": {"type": "string", "enum": ["add", "done"]},
+         "title": {"type": "string", "description": "What's to be done, as an action: 'Send Anna the deck'"}, "body": _S,
+         "owner": {"type": "string", "enum": ["me", "domo"]},
+         "due": {"type": "string", "description": "Local ISO date or date-time it's promised by: 2026-11-13 or 2026-11-13T17:00"},
+         "who": {"type": "string", "description": "When someone else promised it (Frida, a plumber): their name, to check in with them when due"},
          "id": {"type": "string", "description": "For action 'done'"}, "space": _SPACE},
         []), domo_todo, "☑️"),
     ("domo_receipt", _schema(
@@ -381,6 +388,8 @@ PROMPT = (
     "- After you act, domo_receipt with proof and how to undo.\n"
     "- Facts people ask for again: domo_fact.\n"
     "- Check domo_open before asking something you may already have asked.\n"
+    "- When someone commits to something by a time ('I'll send the deck Friday', 'Frida books the dentist this week'),"
+    " domo_todo add it with due (and who, if it's someone else) so it comes back when due.\n"
     "- Their work on other machines (Claude Code, Cursor on the MacBook): domo_work.\n"
     "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"    "- Reports, digests and replies with posts, numbers or screenshots: follow the domo-rich-reports skill.\n"
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"

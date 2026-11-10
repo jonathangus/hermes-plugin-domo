@@ -8,6 +8,7 @@ through to that profile's API server over loopback, with the space each is filed
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -25,7 +26,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, local, memory, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
+from domo import access, bridge, filing, files as attach, github, local, memory, plan, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -383,6 +384,7 @@ class SpacePatch(BaseModel):
     color: str | None = Field(None, pattern=_COLOR)
     description: str | None = None
     prompt: str | None = None
+    keep_moving: bool | None = None
 
 
 class SpaceTag(BaseModel):
@@ -532,6 +534,16 @@ def _repo_env() -> dict[str, str]:
 def repos(fresh: bool = False):
     """The Mac's git repos, most recent first. Runs name theirs in data.repo."""
     return {"repos": repo_scan.scan(_repo_env(), fresh=fresh)}
+
+
+@router.get("/github/pr")
+async def pull_request(url: str = Query(..., max_length=300)):
+    """Where a linked pull request stands (state, checks, size), read with the Mac's `gh`; null when it can't be."""
+    if not github.PR_URL.match(url):
+        raise HTTPException(422, "not a github.com pull request URL")
+    pr = await asyncio.to_thread(github.pull_request, url)
+    return Response(content=json.dumps({"pr": pr}), media_type="application/json",
+                    headers={"Cache-Control": f"private, max-age={int(github._ttl(pr) // 2)}"})
 
 
 class StartRun(BaseModel):
@@ -688,12 +700,13 @@ class VoteIn(BaseModel):
     item: str | None = None
     title: str = ""
     instinct: str | None = None
+    until: float | None = None   # snooze: when it comes back
 
 
 @router.post("/suggestions/vote")
 def vote(body: VoteIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
     try:
-        suggest.vote(_store(profile), body.key, body.kind, body.verdict, body.item, body.title, body.instinct)
+        suggest.vote(_store(profile), body.key, body.kind, body.verdict, body.item, body.title, body.instinct, body.until)
     except StoreError as exc:
         raise HTTPException(400, str(exc))
     return {"ok": True}
@@ -1226,6 +1239,25 @@ class ApprovalIn(BaseModel):
 @router.post("/runs/{run_id}/approval")
 async def run_approval(run_id: str, body: ApprovalIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
     return await _passthrough(profile, "POST", f"/v1/runs/{run_id}/approval", body=body.model_dump(exclude_none=True))
+
+
+class SteerIn(BaseModel):
+    message: str = Field(..., min_length=1, max_length=20000)
+
+
+@router.post("/runs/{run_id}/steer")
+async def run_steer(run_id: str, body: SteerIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """A message for the turn that's running, read after its current step (Hermes's steer). A 409 means
+    the turn can't take it any more: send it as the next message instead."""
+    if not re.match(r"^run_[A-Za-z0-9_-]{1,80}$", run_id):
+        raise HTTPException(404, "no such run")
+    return await _passthrough(profile, "POST", f"/v1/runs/{run_id}/steer", body={"input": body.message})
+
+
+@router.get("/claude/usage")
+async def claude_usage(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """The Claude plan's session and weekly limits from the Mac's `claude` sign-in (domo/plan.py); null without one."""
+    return {"usage": await asyncio.to_thread(plan.usage, _home(profile))}
 
 
 @router.get("/jobs")
