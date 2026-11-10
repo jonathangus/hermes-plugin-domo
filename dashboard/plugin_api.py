@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -24,7 +25,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, local, memory, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
+from domo import access, bridge, filing, files as attach, local, memory, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -1000,6 +1001,154 @@ def download(path: Optional[str] = None, space_id: Optional[str] = None,
     if not found:
         raise HTTPException(404, "not a file Domo can hand out")
     return FileResponse(found, headers={"Cache-Control": "private, max-age=86400"})
+
+
+# ---- recordings from the phone ------------------------------------------------------------------
+
+# recordings being transcribed or handed over in this process: (profile, id)
+_RECORDING: set[tuple[str, str]] = set()
+
+
+@router.post("/recordings")
+async def upload_recording(request: Request, background: BackgroundTasks, id: str = Query(...),
+                           name: str = Query("Recording.m4a"), note: str = Query(""),
+                           duration: float = Query(0, ge=0), started_at: float = Query(0, ge=0),
+                           session_id: Optional[str] = Query(None), space_id: Optional[str] = Query(None),
+                           profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """A recording's audio as the whole body (the phone sends it from a file, in the background, and
+    may send it again): saved, then transcribed here and handed to the agent in the chat it was
+    recorded in, or a new one (filed under ``space_id`` when it was recorded in a space). An id
+    already saved answers with that recording."""
+    if not recordings.ID.match(id):
+        raise HTTPException(422, "id: 8 to 64 letters, digits and dashes")
+    home, store = _home(profile), _store(profile)
+    found = recordings.get(home, id)
+    if found:
+        _resume_recording(background, profile, found)
+        return found
+    if space_id:
+        _space_or_404(store, space_id)
+    path = recordings.audio_path(home, id, name)
+    size = 0
+    try:
+        with path.open("wb") as out:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > recordings.MAX_BYTES:
+                    raise HTTPException(413, f"over {recordings.MAX_BYTES // (1024 ** 3)} GB")
+                out.write(chunk)
+        if size == 0:
+            raise HTTPException(422, "no audio in the request")
+    except BaseException:
+        path.unlink(missing_ok=True)
+        raise
+    started = started_at or time.time() - duration
+    rec_title = recordings.title(started, note)
+    if not session_id:
+        session_id = await _recording_chat(profile, rec_title, id)
+        if space_id:
+            store.tag_session(session_id, space_id)
+    space_id = (store.session_space(session_id) or {}).get("space_id")
+    mime = (request.headers.get("content-type") or "").split(";")[0].strip() or "audio/mp4"
+    display = path.name.split("-", 1)[1]
+    store.add_file(str(path), display, mime, size, session_id=session_id, space_id=space_id)
+    rec = recordings.put(home, {
+        "id": id, "title": rec_title, "note": " ".join(note.split())[:500], "duration": duration, "started_at": started,
+        "created_at": time.time(), "session_id": session_id, "audio": str(path), "name": display, "mime": mime,
+        "size": size, "status": "saved", "progress": 0.0, "error": "", "engine": recordings.engine(recordings.settings()),
+    })
+    background.add_task(_hand_over, profile, id)
+    return rec
+
+
+@router.get("/recordings")
+def list_recordings(background: BackgroundTasks, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    rows = recordings.listing(_home(profile))
+    for rec in rows:
+        _resume_recording(background, profile, rec)
+    return {"recordings": rows}
+
+
+@router.get("/recordings/{rec_id}")
+def get_recording(rec_id: str, background: BackgroundTasks, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    rec = recordings.get(_home(profile), rec_id)
+    if not rec:
+        raise HTTPException(404, "no such recording")
+    _resume_recording(background, profile, rec)
+    return rec
+
+
+def _resume_recording(background: BackgroundTasks, profile: str, rec: dict) -> None:
+    """One the dashboard stopped in the middle of (a restart) carries on when it's next asked about."""
+    if rec.get("status") in recordings.OPEN and (profile, rec["id"]) not in _RECORDING:
+        background.add_task(_hand_over, profile, rec["id"])
+
+
+async def _recording_chat(profile: str, title: str, rec_id: str) -> str:
+    for attempt in (title, f"{title} ({rec_id[:4]})"):   # titles are unique per profile
+        try:
+            session = await _passthrough(profile, "POST", "/api/sessions", body={"title": attempt})
+        except HTTPException as exc:
+            if exc.status_code == 400:
+                continue
+            raise
+        session_id = session.get("id") or (session.get("session") or {}).get("id")
+        if session_id:
+            return session_id
+    raise HTTPException(502, "Hermes didn't start a chat for the recording")
+
+
+async def _hand_over(profile: str, rec_id: str) -> None:
+    """Transcribe, save the transcript beside the audio, and run the agent's turn on it in the chat."""
+    key = (profile, rec_id)
+    if key in _RECORDING:
+        return
+    _RECORDING.add(key)
+    home, store = _home(profile), _store(profile)
+    rec = recordings.get(home, rec_id)
+    session_id = rec["session_id"]
+    mine = _WORKING.setdefault(profile, {})   # the chat shows as working, on every device, from the start
+    mine[session_id] = mine.get(session_id, 0) + 1
+    try:
+        recordings.update(home, rec_id, status="transcribing", progress=0.0, error="")
+        shown = [0.0]
+
+        def progress(p: float) -> None:
+            if p - shown[0] >= 0.02 or p >= 1:
+                shown[0] = p
+                recordings.update(home, rec_id, progress=round(p, 3))
+
+        t = await asyncio.to_thread(recordings.transcribe, Path(rec["audio"]), progress)
+        if not t["text"].strip():
+            raise recordings.TranscriptionError("No speech in the recording")
+        md = recordings.markdown(rec, t)
+        space_id = (store.session_space(session_id) or {}).get("space_id")
+        saved = attach.save(home, f"{Path(rec['name']).stem} transcript.md", md.encode(), "text/markdown",
+                            store=store, session_id=session_id, space_id=space_id)
+        rec = recordings.update(home, rec_id, status="thinking", progress=1.0, transcript=saved["path"],
+                                engine=t["engine"], model=t["model"], language=t["language"], words=len(t["text"].split()))
+        said, ask = recordings.turn(rec, md)
+        found = [f for f in (attach.describe(home, rec["audio"]), attach.describe(home, saved["path"])) if f]
+        instructions = [x for x in (_tag_context(store, session_id), memory.for_prompt(store)) if x] + [ask]
+        payload = {"message": attach.compose(said, found), "instructions": "\n\n".join(instructions)}
+        store.note("asked", said[:160], ref=session_id, space="")
+        failed = False
+        async for chunk in _api(profile).stream(f"/api/sessions/{session_id}/chat/stream", payload):
+            failed = failed or chunk.startswith(b"event: error")
+        recordings.update(home, rec_id, status="failed" if failed else "done",
+                          error="The agent didn't answer; the transcript is saved with the recording" if failed else "")
+    except Exception as exc:
+        log.exception("recording %s for %s", rec_id, profile)
+        recordings.update(home, rec_id, status="failed", error=str(exc)[:300] or type(exc).__name__)
+    finally:
+        _RECORDING.discard(key)
+        left = mine.get(session_id, 1) - 1
+        if left > 0:
+            mine[session_id] = left
+        else:
+            mine.pop(session_id, None)
+    if not store.session_space(session_id):
+        threading.Thread(target=_file_quietly, args=(home, store, session_id), daemon=True).start()
 
 
 class ApprovalIn(BaseModel):
