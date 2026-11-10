@@ -16,3 +16,4 @@ provides_tools:
   - domo_suggest
   - domo_memory
   - domo_open
+  - minne

@@ -264,6 +264,19 @@ def domo_work(args: dict, session_id: str) -> str:
     return _fail("action is recent, day, search, thread or running")
 
 
+@_guard
+def domo_minne(args: dict, session_id: str) -> str:
+    """The organisation's Minne meetings, for a profile with its key (minne.py)."""
+    from . import minne
+    token = minne.key(current_home())
+    if not token:
+        return _fail("no MINNE_KEY in this profile's .env")
+    try:
+        return _ok(**minne.run(token, args))
+    except minne.MinneError as exc:
+        return _fail(str(exc))
+
+
 # ---- schemas ----------------------------------------------------------------------------------
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:

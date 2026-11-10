@@ -4,7 +4,7 @@ The backend of [Domo](https://github.com/jonathangus), a chief-of-staff app for 
 
 It gives each agent:
 
-- Tools: `domo_ask` (decision cards before anything outbound, paying or deleting), `domo_todo`, `domo_receipt`, `domo_run`, `domo_brief`, `domo_fact`, `domo_suggest`, `domo_memory`, `domo_open`, and `domo_shared` (shared notes between agents).
+- Tools: `domo_ask` (decision cards before anything outbound, paying or deleting), `domo_todo`, `domo_receipt`, `domo_run`, `domo_brief`, `domo_fact`, `domo_suggest`, `domo_memory`, `domo_open`, `domo_shared` (shared notes between agents), and `minne` with an organisation's Minne key (see Optional extras).
 - Dashboard routes under `/api/plugins/domo/*`: decisions, to-dos, runs, receipts, spaces, chat and session passthrough to the profile's API server, routines (cron), files, memory, search.
 - A per-profile SQLite store in `<profile>/plugin-data/domo/`.
 
@@ -71,6 +71,7 @@ A Hermes with this plugin can join another Domo (a work computer beside the home
 - Auto-filing chats into spaces: `TYPESAFE_API_KEY`. Without it chats stay where you put them.
 - `rtk` on PATH: compresses terminal output before it reaches the model.
 - `DOMO_REPO_ROOTS`: colon-separated folders the app scans for git repos.
+- An organisation's meetings in [Minne](https://useminne.com/developers/): its key (`MINNE_KEY=minne_sk_…`, made by an admin on the organisation's page in Minne) in a profile's own `.env` gives that profile's agent a read-only `minne` tool: search, list, a meeting's summary and who spoke, its transcript. Only that profile: a key never crosses to another. Restart the gateway after adding it. For a person's own meetings, connect Minne's MCP server with their sign-in instead: `hermes mcp add minne --url https://api.useminne.com/mcp --auth oauth`.
 
 ## Compatibility
 
