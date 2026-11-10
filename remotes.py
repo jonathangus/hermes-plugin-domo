@@ -159,7 +159,8 @@ async def probe(name: str, url: str, username: str, password: str) -> list[dict]
             raise RemoteError(502, f"{name} answers, but the Domo plugin isn't on it")
         if r.status_code >= 400:
             raise RemoteError(502, f"{name} said {r.status_code} for its profiles")
-        return [{k: p.get(k) for k in ("id", "display_name", "kind", "members", "spaces")} for p in r.json().get("profiles", [])]
+        return [{**{k: p.get(k) for k in ("id", "display_name", "kind", "members", "spaces")}, "features": p.get("features") or []}
+                for p in r.json().get("profiles", [])]
 
 
 async def _refresh(remote_id: str) -> None:

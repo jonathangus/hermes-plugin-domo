@@ -46,6 +46,7 @@ EVERY = 20.0
 
 CRON_HINT = re.compile(r"\[IMPORTANT: You are running as a scheduled cron job.*?another job\.\]\s*", re.S)
 RUN_TIME = re.compile(r"\[CURRENT RUN TIME: [^\]]*\]\s*")
+STEER = re.compile(r"\[/?OUT-OF-BAND USER MESSAGE[^\]]*\]\s*")   # Hermes's frame around a message that steered a turn
 ATTACH = re.compile(r"\[Domo attachments\](.*)", re.S)
 MEDIA = re.compile(r"MEDIA:\s*(\S+)")
 DATA_URL = re.compile(r"!?\[[^\]]*\]\(data:[^)]+\)")
@@ -116,6 +117,7 @@ def clean(content: Optional[str]) -> str:
             pass
     text = CRON_HINT.sub("", text)
     text = RUN_TIME.sub("", text)
+    text = STEER.sub("", text)
     files = []
     m = ATTACH.search(text)
     if m:

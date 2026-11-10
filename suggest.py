@@ -22,7 +22,7 @@ from typing import Optional
 
 from . import memory, search
 
-KIND_WEIGHT = {"habit": 0.86, "reply": 0.92, "run": 0.88, "routine-failed": 0.82, "idea": 0.8, "repo": 0.72, "todo": 0.62, "make-routine": 0.55}
+KIND_WEIGHT = {"habit": 0.86, "reply": 0.92, "promise": 0.9, "check-in": 0.84, "run": 0.88, "routine-failed": 0.82, "idea": 0.8, "repo": 0.72, "todo": 0.62, "make-routine": 0.55}
 LIMIT = 8
 STOP = set("the a an and or to of in on for with at by from is are was be it this that these those i you we me my our your please "
            "can could would will should do does did have has had make get let just about what which when where how why there here "
@@ -137,11 +137,63 @@ def _runs(store) -> list[dict]:
     return out
 
 
+def due_at(due: object) -> Optional[float]:
+    """A to-do's due moment from its ISO date or date-time; a bare date means the end of that day.
+    None for anything else (older to-dos kept free text like "Friday")."""
+    text = str(due or "").strip()
+    if not text:
+        return None
+    try:
+        if len(text) == 10:
+            return datetime.fromisoformat(text).replace(hour=23, minute=59).timestamp()
+        return datetime.fromisoformat(text).timestamp()
+    except ValueError:
+        return None
+
+
+def _verb(title: str) -> str:
+    """'Send the deck' as it reads mid-sentence: 'send the deck' (a name or an acronym keeps its capital)."""
+    return title[:1].lower() + title[1:] if title[1:2].islower() else title
+
+
+def _whole_day(at: float) -> bool:
+    d = datetime.fromtimestamp(at)
+    return (d.hour, d.minute) == (23, 59)
+
+
+def _when(at: float, now: float) -> str:
+    d, today = datetime.fromtimestamp(at), datetime.fromtimestamp(now)
+    days = (d.date() - today.date()).days
+    day = "today" if days == 0 else "tomorrow" if days == 1 else "yesterday" if days == -1 else f"{d:%a %d %b}"
+    return day if _whole_day(at) else f"{day} {d:%H:%M}"
+
+
 def _todos(store) -> list[dict]:
-    return [{"kind": "todo", "key": f"todo:{t['id']}", "title": f"Let Domo: {t['title']}", "at": t["created_at"], "space": t["space"],
-             "because": f"On your list {_ago(t['created_at'])}, marked for Domo to do",
-             "action": {"type": "chat", "prefill": f"Go ahead with the to-do “{t['title']}”. Ask me before anything goes out or costs money."}}
-            for t in store.list("todo", status="open") if (t["data"].get("owner") == "domo")]
+    """What Domo may do, and promises (anyone's) coming due: from the start of the day, or three hours before a time."""
+    now = time.time()
+    out = []
+    for t in store.list("todo", status="open"):
+        owner, who = t["data"].get("owner"), str(t["data"].get("who") or "").strip()
+        due = due_at(t["data"].get("due"))
+        start = None if due is None else datetime.fromtimestamp(due).replace(hour=0, minute=0).timestamp() if _whole_day(due) else due - 3 * 3600
+        coming = start is not None and now >= start
+        by = f"by {_when(due, now)}" if due is not None else ""
+        past = " · overdue" if coming and now > due else ""
+        base = {"key": f"todo:{t['id']}", "at": max(t["created_at"], start or 0), "space": t["space"]}
+        if who:
+            if coming:
+                out.append({**base, "kind": "check-in", "title": f"Check in with {who}: {t['title']}", "because": f"{who} promised it {by}{past}",
+                            "action": {"type": "chat", "prefill": f"{who} said they'd {_verb(t['title'])} {by}. Find out whether it happened"
+                                       " (our chats, shared notes); if it didn't, draft a friendly nudge for me to send."}})
+        elif owner == "domo":
+            out.append({**base, "kind": "todo", "title": f"Let Domo: {t['title']}",
+                        "because": f"You asked for it {by}{past}" if coming else f"On your list {_ago(t['created_at'])}, marked for Domo to do",
+                        "action": {"type": "chat", "prefill": f"Go ahead with the to-do “{t['title']}”. Ask me before anything goes out or costs money."}})
+        elif coming:
+            out.append({**base, "kind": "promise", "title": t["title"], "because": f"You promised it {by}{past}",
+                        "action": {"type": "chat", "prefill": f"I said I'd {_verb(t['title'])} {by}. Help me get it done now: prepare what you can"
+                                   " and tell me what's left for me."}})
+    return out
 
 
 def _ideas(store) -> list[dict]:
@@ -212,7 +264,12 @@ def build(home: Path, store, *, routines: list[dict], repos: list[dict], limit: 
     return rank(found, store.kind_weights(), store.hidden_suggestions(), limit)
 
 
-def vote(store, key: str, kind: str, verdict: str, item: Optional[str] = None, title: str = "", instinct: Optional[str] = None) -> None:
+def vote(store, key: str, kind: str, verdict: str, item: Optional[str] = None, title: str = "", instinct: Optional[str] = None,
+         until: Optional[float] = None) -> None:
+    if verdict == "snooze":   # not a judgement on the suggestion: only "not now, then"
+        store.snooze(key, float(until or 0))
+        store.note("suggestion", f"snoozed the {kind} suggestion “{title or key}” until {datetime.fromtimestamp(float(until or 0)):%a %H:%M}", ref=key)
+        return
     store.vote(key, kind, verdict)
     if item and verdict in ("done", "dismiss"):   # an idea the agent left is settled once acted on or turned down
         store.update(item, status="done" if verdict == "done" else "dismissed")
