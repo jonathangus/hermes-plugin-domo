@@ -918,10 +918,12 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
         _space_or_404(store, body.space_id)
         store.tag_session(session_id, body.space_id)
     api = _api(profile)
-    content = attach.compose(body.message, found)
+    held = [r for r in (recordings.by_audio(home, f["path"]) for f in found) if r]
+    for rec in held:   # the type the recording came with (a name says .webm is video)
+        next(f for f in found if f["path"] == str(Path(rec["audio"]).resolve()))["mime"] = rec.get("mime") or "audio/mp4"
     tag = store.session_space(session_id)
     space = store.space(tag["space_id"]) if tag and tag["space_id"] else None
-    payload = {"message": content}
+    payload = {"message": attach.compose(body.message, found)}
     if body.model:   # locked, so it holds: a bare model only counts on a session's first turn
         payload.update({"model": body.model, "require_model_lock": True, **({"provider": body.provider} if body.provider else {})})
     context = _tag_context(store, session_id)
@@ -941,6 +943,17 @@ async def chat_stream(session_id: str, body: ChatIn, profile: str = Query(bridge
         mine = _WORKING.setdefault(profile, {})
         mine[session_id] = mine.get(session_id, 0) + 1
         try:
+            # a recording sent with the message: its transcript goes with the turn (waiting for it if need be)
+            files, told = list(found), []
+            for rec in held:
+                async for beat in _transcript_ready(profile, rec["id"]):
+                    yield beat
+                transcript, note = _attached_transcript(profile, store, rec["id"], session_id)
+                files += [transcript] if transcript else []
+                told.append(note)
+            if held:
+                payload["message"] = attach.compose(body.message, files)
+                payload["instructions"] = "\n\n".join(instructions + told)
             async for chunk in api.stream(f"/api/sessions/{session_id}/chat/stream", payload):
                 yield chunk
         finally:
@@ -1007,6 +1020,7 @@ def download(path: Optional[str] = None, space_id: Optional[str] = None,
 
 # recordings being transcribed or handed over in this process: (profile, id)
 _RECORDING: set[tuple[str, str]] = set()
+_TASKS: set[asyncio.Task] = set()   # transcriptions picked up again, kept until they end
 
 
 @router.post("/recordings")
@@ -1014,10 +1028,11 @@ async def upload_recording(request: Request, background: BackgroundTasks, id: st
                            name: str = Query("Recording.m4a"), note: str = Query(""),
                            duration: float = Query(0, ge=0), started_at: float = Query(0, ge=0),
                            session_id: Optional[str] = Query(None), space_id: Optional[str] = Query(None),
-                           profile: str = Query(bridge.DEFAULT, alias="agent")):
+                           hold: bool = Query(False), profile: str = Query(bridge.DEFAULT, alias="agent")):
     """A recording's audio as the whole body (the phone sends it from a file, in the background, and
-    may send it again): saved, then transcribed here and handed to the agent in the chat it was
-    recorded in, or a new one (filed under ``space_id`` when it was recorded in a space). An id
+    may send it again), transcribed here as soon as it's saved. With ``hold`` it's an attachment: the
+    person sends it with a message, and that turn waits for the transcript. Without, it's handed to the
+    agent on its own, in the chat it was recorded in or a new one (filed under ``space_id``). An id
     already saved answers with that recording."""
     if not recordings.ID.match(id):
         raise HTTPException(422, "id: 8 to 64 letters, digits and dashes")
@@ -1026,7 +1041,7 @@ async def upload_recording(request: Request, background: BackgroundTasks, id: st
     if found:
         _resume_recording(background, profile, found)
         return found
-    if space_id:
+    if space_id and not hold:
         _space_or_404(store, space_id)
     path = recordings.audio_path(home, id, name)
     size = 0
@@ -1044,20 +1059,21 @@ async def upload_recording(request: Request, background: BackgroundTasks, id: st
         raise
     started = started_at or time.time() - duration
     rec_title = recordings.title(started, note)
-    if not session_id:
+    if not hold and not session_id:
         session_id = await _recording_chat(profile, rec_title, id)
         if space_id:
             store.tag_session(session_id, space_id)
-    space_id = (store.session_space(session_id) or {}).get("space_id")
+    space_id = (store.session_space(session_id) or {}).get("space_id") if session_id else None
     mime = (request.headers.get("content-type") or "").split(";")[0].strip() or "audio/mp4"
     display = path.name.split("-", 1)[1]
     store.add_file(str(path), display, mime, size, session_id=session_id, space_id=space_id)
     rec = recordings.put(home, {
         "id": id, "title": rec_title, "note": " ".join(note.split())[:500], "duration": duration, "started_at": started,
-        "created_at": time.time(), "session_id": session_id, "audio": str(path), "name": display, "mime": mime,
-        "size": size, "status": "saved", "progress": 0.0, "error": "", "engine": recordings.engine(recordings.settings()),
+        "created_at": time.time(), "session_id": session_id or "", "hold": hold, "audio": str(path), "path": str(path),
+        "name": display, "mime": mime, "size": size, "status": "saved", "progress": 0.0, "error": "",
+        "engine": recordings.engine(recordings.settings()),
     })
-    background.add_task(_hand_over, profile, id)
+    background.add_task(_transcribe if hold else _hand_over, profile, id)
     return rec
 
 
@@ -1081,7 +1097,7 @@ def get_recording(rec_id: str, background: BackgroundTasks, profile: str = Query
 def _resume_recording(background: BackgroundTasks, profile: str, rec: dict) -> None:
     """One the dashboard stopped in the middle of (a restart) carries on when it's next asked about."""
     if rec.get("status") in recordings.OPEN and (profile, rec["id"]) not in _RECORDING:
-        background.add_task(_hand_over, profile, rec["id"])
+        background.add_task(_transcribe if rec.get("hold") else _hand_over, profile, rec["id"])
 
 
 async def _recording_chat(profile: str, title: str, rec_id: str) -> str:
@@ -1098,17 +1114,14 @@ async def _recording_chat(profile: str, title: str, rec_id: str) -> str:
     raise HTTPException(502, "Hermes didn't start a chat for the recording")
 
 
-async def _hand_over(profile: str, rec_id: str) -> None:
-    """Transcribe, save the transcript beside the audio, and run the agent's turn on it in the chat."""
+async def _transcribe(profile: str, rec_id: str) -> Optional[dict]:
+    """The recording's words, kept beside its record; None when they can't be had (the record says why)."""
     key = (profile, rec_id)
     if key in _RECORDING:
-        return
+        return None
     _RECORDING.add(key)
-    home, store = _home(profile), _store(profile)
+    home = _home(profile)
     rec = recordings.get(home, rec_id)
-    session_id = rec["session_id"]
-    mine = _WORKING.setdefault(profile, {})   # the chat shows as working, on every device, from the start
-    mine[session_id] = mine.get(session_id, 0) + 1
     try:
         recordings.update(home, rec_id, status="transcribing", progress=0.0, error="")
         shown = [0.0]
@@ -1121,12 +1134,66 @@ async def _hand_over(profile: str, rec_id: str) -> None:
         t = await asyncio.to_thread(recordings.transcribe, Path(rec["audio"]), progress)
         if not t["text"].strip():
             raise recordings.TranscriptionError("No speech in the recording")
-        md = recordings.markdown(rec, t)
-        space_id = (store.session_space(session_id) or {}).get("space_id")
-        saved = attach.save(home, f"{Path(rec['name']).stem} transcript.md", md.encode(), "text/markdown",
-                            store=store, session_id=session_id, space_id=space_id)
-        rec = recordings.update(home, rec_id, status="thinking", progress=1.0, transcript=saved["path"],
-                                engine=t["engine"], model=t["model"], language=t["language"], words=len(t["text"].split()))
+        recordings.save_words(home, rec_id, t)
+        recordings.update(home, rec_id, status="transcribed", progress=1.0, engine=t["engine"], model=t["model"],
+                          language=t["language"], words=len(t["text"].split()))
+        return t
+    except Exception as exc:
+        log.exception("recording %s for %s", rec_id, profile)
+        recordings.update(home, rec_id, status="failed", error=str(exc)[:300] or type(exc).__name__)
+        return None
+    finally:
+        _RECORDING.discard(key)
+
+
+def _save_transcript(home: Path, store: Store, rec: dict, t: dict, session_id: str) -> tuple[str, dict]:
+    md = recordings.markdown(rec, t)
+    space_id = (store.session_space(session_id) or {}).get("space_id")
+    saved = attach.save(home, f"{Path(rec['name']).stem} transcript.md", md.encode(), "text/markdown",
+                        store=store, session_id=session_id, space_id=space_id)
+    return md, saved
+
+
+async def _transcript_ready(profile: str, rec_id: str):
+    """Waits for an attached recording's words, a comment line a second so the chat's stream stays open
+    (both apps' SSE readers skip comments)."""
+    home = _home(profile)
+    while (rec := recordings.get(home, rec_id)) and rec["status"] in recordings.OPEN:
+        if (profile, rec_id) not in _RECORDING:   # cut off by a restart: start it again
+            task = asyncio.create_task(_transcribe(profile, rec_id))
+            _TASKS.add(task)
+            task.add_done_callback(_TASKS.discard)
+        yield f": transcribing {round((rec.get('progress') or 0) * 100)}%\n\n".encode()
+        await asyncio.sleep(1)
+
+
+def _attached_transcript(profile: str, store: Store, rec_id: str, session_id: str) -> tuple[Optional[dict], str]:
+    """For a recording sent with a message: its transcript as a file in the chat, and what the agent is told."""
+    home = _home(profile)
+    rec = recordings.get(home, rec_id) or {}
+    t = recordings.words(home, rec_id)
+    if not t:
+        return None, (f"[Domo] The attached recording couldn't be transcribed ({rec.get('error') or 'no words'}). "
+                      "Say so in a line, and that sending it again tries again.")
+    md, saved = _save_transcript(home, store, rec, t, session_id)
+    recordings.update(home, rec_id, status="done", session_id=session_id, transcript=saved["path"])
+    return attach.describe(home, saved["path"]), recordings.guidance(md, attached=True)
+
+
+async def _hand_over(profile: str, rec_id: str) -> None:
+    """A recording sent on its own: transcribe, save the transcript beside the audio, and run the agent's
+    turn on it in its chat."""
+    home, store = _home(profile), _store(profile)
+    session_id = recordings.get(home, rec_id)["session_id"]
+    mine = _WORKING.setdefault(profile, {})   # the chat shows as working, on every device, from the start
+    mine[session_id] = mine.get(session_id, 0) + 1
+    try:
+        t = await _transcribe(profile, rec_id)
+        if t is None:
+            return
+        rec = recordings.get(home, rec_id)
+        md, saved = _save_transcript(home, store, rec, t, session_id)
+        rec = recordings.update(home, rec_id, status="thinking", transcript=saved["path"])
         said, ask = recordings.turn(rec, md)
         found = [f for f in (attach.describe(home, rec["audio"]), attach.describe(home, saved["path"])) if f]
         instructions = [x for x in (_tag_context(store, session_id), memory.for_prompt(store)) if x] + [ask]
@@ -1141,7 +1208,6 @@ async def _hand_over(profile: str, rec_id: str) -> None:
         log.exception("recording %s for %s", rec_id, profile)
         recordings.update(home, rec_id, status="failed", error=str(exc)[:300] or type(exc).__name__)
     finally:
-        _RECORDING.discard(key)
         left = mine.get(session_id, 1) - 1
         if left > 0:
             mine[session_id] = left
