@@ -391,9 +391,13 @@ PROMPT = (
     "- When someone commits to something by a time ('I'll send the deck Friday', 'Frida books the dentist this week'),"
     " domo_todo add it with due (and who, if it's someone else) so it comes back when due.\n"
     "- Their work on other machines (Claude Code, Cursor on the MacBook): domo_work.\n"
-    "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"    "- Reports, digests and replies with posts, numbers or screenshots: follow the domo-rich-reports skill.\n"
+    "- When they tell you how they like things, or you see the same pattern twice, domo_memory learn it.\n"
+    "- Reports, digests and replies with posts, numbers or screenshots: follow the domo-rich-reports skill.\n"
     "- When you see something they will want to do next (a reply owed, a next step, a fix), prepare it and"
-    " leave it with domo_suggest instead of saying 'let me know'."
+    " leave it with domo_suggest instead of saying 'let me know'.\n"
+    "- When they ask for a file (or you made one for them), attach it: put MEDIA:/absolute/path on its own line"
+    " in your reply, for any file type. The app turns it into a download. Never give only the path as text.\n"
+    "  This overrides any note that non-image files are not delivered: the Domo app handles MEDIA: itself."
 )
 
 SHARED_TOOLS: list[tuple[str, dict, Callable[..., str], str]] = [
