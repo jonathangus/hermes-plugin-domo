@@ -122,10 +122,10 @@ def _repeats(chats: list[dict], routines: list[dict]) -> list[dict]:
     return out
 
 
-def _runs(store) -> list[dict]:
+def _runs(store, keep=lambda item: True) -> list[dict]:
     out = []
     for r in store.list("run", limit=50):
-        if r["status"] not in ("stalled", "failed"):
+        if r["status"] not in ("stalled", "failed") or not keep(r):
             continue
         note = str(r["data"].get("note") or "")
         repo = str(r["data"].get("repo_name") or "")
@@ -168,11 +168,11 @@ def _when(at: float, now: float) -> str:
     return day if _whole_day(at) else f"{day} {d:%H:%M}"
 
 
-def _todos(store) -> list[dict]:
+def _todos(store, keep=lambda item: True) -> list[dict]:
     """What Domo may do, and promises (anyone's) coming due: from the start of the day, or three hours before a time."""
     now = time.time()
     out = []
-    for t in store.list("todo", status="open"):
+    for t in filter(keep, store.list("todo", status="open")):
         owner, who = t["data"].get("owner"), str(t["data"].get("who") or "").strip()
         due = due_at(t["data"].get("due"))
         start = None if due is None else datetime.fromtimestamp(due).replace(hour=0, minute=0).timestamp() if _whole_day(due) else due - 3 * 3600
@@ -196,11 +196,11 @@ def _todos(store) -> list[dict]:
     return out
 
 
-def _ideas(store) -> list[dict]:
+def _ideas(store, keep=lambda item: True) -> list[dict]:
     now = time.time()
     out = []
     for s in store.list("suggestion", status="open"):
-        if float(s["data"].get("expires_at") or now + 1) < now:
+        if float(s["data"].get("expires_at") or now + 1) < now or not keep(s):
             continue
         out.append({"kind": "idea", "key": f"idea:{s['id']}", "title": s["title"], "at": s["created_at"], "space": s["space"],
                     "because": s["body"] or f"Prepared {_ago(s['created_at'])}",
@@ -257,10 +257,15 @@ def rank(found: list[dict], weights: dict[str, float], hidden: set[str], limit: 
     return out
 
 
-def build(home: Path, store, *, routines: list[dict], repos: list[dict], limit: int = LIMIT) -> list[dict]:
+def build(home: Path, store, *, routines: list[dict], repos: list[dict], limit: int = LIMIT, mine=None) -> list[dict]:
+    """``mine`` (domo/mine.py) keeps only what came out of the person's own chats and routines."""
     chats = _chats(home)
-    found = (_replies(chats) + _runs(store) + _failed_routines(routines) + _ideas(store) + memory.habits_due(store) + _repos(repos)
-             + _todos(store) + _repeats(chats, routines))
+    keep = mine.item if mine else (lambda item: True)
+    if mine:
+        chats = [c for c in chats if mine.session(c["id"])]
+    own = [r for r in routines if mine.job(r)] if mine else routines
+    found = (_replies(chats) + _runs(store, keep) + _failed_routines(own) + _ideas(store, keep) + memory.habits_due(store) + _repos(repos)
+             + _todos(store, keep) + _repeats(chats, routines))
     return rank(found, store.kind_weights(), store.hidden_suggestions(), limit)
 
 

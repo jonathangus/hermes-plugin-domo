@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))  # the plugins dir, so `domo` imports as a package
 
-from domo import access, bridge, filing, files as attach, github, local, memory, minne, plan, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
+from domo import access, bridge, filing, files as attach, github, local, memory, mine as owners, minne, plan, recordings, remotes, repos as repo_scan, rtk, search as chat_search, stitch, suggest, work  # noqa: E402
 from domo.store import Store, StoreError, store_path  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -49,7 +49,7 @@ router = APIRouter(route_class=_Relayed, dependencies=[Depends(access.guard)])
 VERSION = "0.1.0"
 # What this plugin's routes can do beyond the basics. An agent on another Hermes lists that one's, so the
 # apps offer each only where it works: an older plugin there lists none, and nothing changes for it.
-FEATURES = ["snooze", "steer", "keep_moving", "plan_usage", "promises"]
+FEATURES = ["snooze", "steer", "keep_moving", "plan_usage", "promises", "mine", "seen"]
 INBOX_TITLE = "Domo inbox"
 DOMO_SOURCE = "api_server"   # Hermes's source for sessions started through its API server, i.e. by Domo
 RUN_TITLE = re.compile(r"^(?P<job>.+) · [A-Z][a-z]{2} \d{1,2} \d{2}:\d{2}$")  # "<job name> · Nov 08 00:00"
@@ -179,6 +179,7 @@ class RemotePatch(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=40)
     enabled: bool | None = None
     agents: list[str] | None = None
+    me: list[str] | None = Field(None, max_length=20)   # who the owner is there (`slack:U0123`): their chats are theirs
 
 
 def _own_remote(request: Request, remote_id: str) -> dict:
@@ -235,6 +236,8 @@ async def patch_connection(remote_id: str, body: RemotePatch, request: Request):
         remote["name"] = body.name.strip()
     if body.enabled is not None:
         remote["enabled"] = body.enabled
+    if body.me is not None:
+        remote["me"] = sorted({m.strip().lower() for m in body.me if m.strip()})
     remotes.save([remote if r["id"] == remote_id else r for r in remotes.load()])
     remotes.forget_client(remote_id)
     return remotes.public(remote)
@@ -250,12 +253,42 @@ def delete_connection(remote_id: str, request: Request):
 
 # ---- Domo items -------------------------------------------------------------------------------
 
+def _mine(profile: str, me: Optional[str]) -> Optional[owners.Mine]:
+    """Only the person's own chats, when the home Mac's relay names who they are here (domo/mine.py)."""
+    ids = owners.parse(me)
+    return None if ids is None else owners.Mine(_home(profile), ids)
+
+
 @router.get("/feed")
-def feed(profile: str = Query(bridge.DEFAULT, alias="agent")):
+def feed(profile: str = Query(bridge.DEFAULT, alias="agent"), me: Optional[str] = Query(None, max_length=2000)):
     _stitching()
     chat_search.ensure_running()
     store = _store(profile)
-    return {"profile": bridge.profile_info(profile), **store.feed()}
+    mine = _mine(profile, me)
+    return {"profile": bridge.profile_info(profile), **store.feed(keep=mine.item if mine else None)}
+
+
+class SeenIn(BaseModel):
+    agent: str = Field(min_length=1, max_length=120)   # whose chats: any agent this person sees
+    since: float | None = None                          # the first look: everything older is read
+    seen: dict[str, float] = Field(default_factory=dict, max_length=2000)   # chat → its last_active when opened
+
+
+@router.get("/seen")
+def seen(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """What this person has read, every agent's chats, kept in their own profile so every device agrees."""
+    return {"agents": _store(profile).seen_state()}
+
+
+@router.post("/seen")
+def mark_seen(body: SeenIn, profile: str = Query(bridge.DEFAULT, alias="agent")):
+    return _store(profile).mark_seen(body.agent.lower(), since=body.since, seen=body.seen)
+
+
+@router.get("/people")
+def people(profile: str = Query(bridge.DEFAULT, alias="agent")):
+    """Who has started chats with this agent (Slack, WhatsApp…), to say which of them is you."""
+    return {"people": owners.people(_home(profile))}
 
 
 @router.get("/changes")
@@ -676,7 +709,8 @@ async def search(q: str = "", profile: str = Query(bridge.DEFAULT, alias="agent"
 
 
 @router.get("/suggestions")
-async def suggestions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(8, ge=1, le=20)):
+async def suggestions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit: int = Query(8, ge=1, le=20),
+                      me: Optional[str] = Query(None, max_length=2000)):
     """Next up: what this person is about to do, each with its reason and one action (domo/suggest.py)."""
     home = _home(profile)
     store = _store(profile)
@@ -686,7 +720,8 @@ async def suggestions(profile: str = Query(bridge.DEFAULT, alias="agent"), limit
         jobs = []   # Hermes away: suggest from what's local
     info = bridge.profile_info(profile)
     repos = repo_scan.scan(_repo_env()) if info.get("kind", "person") == "person" else []
-    found = await asyncio.to_thread(suggest.build, home, store, routines=jobs, repos=repos, limit=limit)
+    mine = await asyncio.to_thread(_mine, profile, me)
+    found = await asyncio.to_thread(suggest.build, home, store, routines=jobs, repos=repos, limit=limit, mine=mine)
     tags = store.session_tags()
     spaces = {s["name"].lower(): s["id"] for s in store.spaces()}
     for s in found:

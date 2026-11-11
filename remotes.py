@@ -2,7 +2,8 @@
 
 The apps only ever talk to this dashboard. A request naming an agent as `<profile>@<hermes>` is passed as it is
 to that Hermes's own dashboard (over Tailscale), signed in with the username and password given when it was
-connected; the answer streams back unchanged. Each connection belongs to one person here (its owner): only a
+connected; the answer streams back unchanged. Home's feed and Next up there carry who the owner is on that
+Hermes (`me=`), so only what came out of their own chats reaches Home (domo/mine.py). Each connection belongs to one person here (its owner): only a
 sign-in that may open the owner's profile sees its agents. Connections live in the default profile's
 plugin-data, beside nothing else, readable by this user only.
 """
@@ -29,6 +30,7 @@ REFRESH_AFTER = 600  # seconds before an agent's name and spaces are read from i
 # Over Tailscale a Hermes that's up answers in milliseconds; one that's away mustn't hold a page up for long
 CONNECT_TIMEOUT = 3.0
 PASS_HEADERS = ("content-type", "cache-control", "content-disposition")
+MINE = ("/feed", "/suggestions")   # what's only the owner's own there: a space's page stitches in everyone's
 transport: Optional[httpx.AsyncBaseTransport] = None  # tests inject the other dashboard
 
 _clients: dict[str, httpx.AsyncClient] = {}
@@ -87,7 +89,7 @@ def may_see(remote: dict, allowed: Optional[set[str]]) -> bool:
 def public(remote: dict) -> dict:
     """What the apps see of a connection: never its password."""
     return {k: remote.get(k) for k in ("id", "name", "url", "username", "owner", "enabled", "refreshed_at")} | {
-        "agents": agents_of(remote)}
+        "me": remote.get("me") or [], "agents": agents_of(remote)}
 
 
 def agents_of(remote: dict) -> list[dict]:
@@ -212,7 +214,9 @@ async def relay(request: Request, agent: str) -> Response:
     if profile not in {a["id"] for a in remote.get("agents", [])}:
         return _error(404, f"{profile!r} isn't one of the agents connected on {remote['name']}")
 
-    params = [(k, profile if k == "agent" else v) for k, v in request.query_params.multi_items()]
+    params = [(k, profile if k == "agent" else v) for k, v in request.query_params.multi_items() if k != "me"]
+    if request.url.path.endswith(MINE):
+        params.append(("me", ",".join(remote.get("me") or [])))
     headers = {k: request.headers[k] for k in ("content-type", "accept") if k in request.headers}
     body = await request.body()
     streaming = request.url.path.endswith("/stream")

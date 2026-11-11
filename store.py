@@ -111,6 +111,19 @@ CREATE TABLE IF NOT EXISTS suggestion_snoozes (
     key    TEXT PRIMARY KEY,
     until  REAL NOT NULL
 );
+-- Which chats the person has read, on any device: in their own profile's store, for every agent they see
+-- (`ours`, `jonathan@work` too). A chat is unread once it moves past what's here, or past `since` (the first
+-- look) when it was never opened.
+CREATE TABLE IF NOT EXISTS seen (
+    agent       TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    at          REAL NOT NULL,
+    PRIMARY KEY (agent, session_id)
+);
+CREATE TABLE IF NOT EXISTS seen_since (
+    agent  TEXT PRIMARY KEY,
+    since  REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS archived_sessions (
     session_id   TEXT PRIMARY KEY,
     archived_at  REAL NOT NULL
@@ -859,6 +872,30 @@ class Store:
             w[kind] = w.get(kind, 1.0) * {"more": 1.15, "less": 0.8, "dismiss": 0.97, "done": 1.03}[verdict]
         return {k: max(0.3, min(1.6, v)) for k, v in w.items()}
 
+    # ---- what the person has read ----------------------------------------------------------
+
+    def seen_state(self, agent: Optional[str] = None) -> dict[str, dict]:
+        """agent → {since, seen: {chat: its last_active when opened}}, for agents looked at before."""
+        where, args = (" WHERE agent = ?", (agent,)) if agent else ("", ())
+        out = {a: {"since": since, "seen": {}} for a, since in self._db.execute(f"SELECT agent, since FROM seen_since{where}", args)}
+        for a, sid, at in self._db.execute(f"SELECT agent, session_id, at FROM seen{where}", args):
+            if a in out:
+                out[a]["seen"][sid] = at
+        return out
+
+    def mark_seen(self, agent: str, *, since: Optional[float] = None, seen: Optional[dict[str, float]] = None) -> dict:
+        """Only ever forward: a device that's behind can't make a read chat unread again. ``since`` sets the
+        first look once; the first device to look wins."""
+        with self._tx() as db:
+            if since is not None:
+                db.execute("INSERT OR IGNORE INTO seen_since (agent, since) VALUES (?, ?)", (agent, since))
+            elif seen:   # opened before any first look: what's older than it counts as read
+                db.execute("INSERT OR IGNORE INTO seen_since (agent, since) VALUES (?, ?)", (agent, max(map(float, seen.values()))))
+            db.executemany("INSERT INTO seen (agent, session_id, at) VALUES (?, ?, ?)"
+                           " ON CONFLICT (agent, session_id) DO UPDATE SET at = MAX(at, excluded.at)",
+                           [(agent, sid, float(at)) for sid, at in (seen or {}).items()])
+        return self.seen_state(agent).get(agent) or {"since": since, "seen": {}}
+
     def set_archived(self, session_id: str, archived: bool) -> None:
         """Remember what was archived here: Hermes's own listing leaves archived chats out entirely."""
         with self._tx() as db:
@@ -938,19 +975,21 @@ class Store:
 
     # ---- summary -----------------------------------------------------------------------------
 
-    def feed(self, *, now: Optional[float] = None) -> dict:
-        """Everything the home screen needs in one read."""
+    def feed(self, *, now: Optional[float] = None, keep=None) -> dict:
+        """Everything the home screen needs in one read; ``keep`` leaves out items it says no to (someone else's)."""
         now = now if now is not None else self._clock()
         self.mark_stalled(now)
         day_start = now - 24 * 3600
-        runs = self.list("run", limit=50)
+        mine = (lambda rows: [r for r in rows if keep(r)]) if keep else (lambda rows: rows)
+        runs = mine(self.list("run", limit=50))
         active = [r for r in runs if r["status"] in ("running", "stalled")]
         recent = [r for r in runs if r["status"] in ("done", "failed") and r["updated_at"] >= day_start]
-        decisions = self.list("decision", status="open")
-        todos = self.list("todo", status="open")
-        receipts = [r for r in self.list("receipt", limit=50) if r["created_at"] >= day_start]
+        decisions = mine(self.list("decision", status="open"))
+        todos = mine(self.list("todo", status="open"))
+        receipts = mine([r for r in self.list("receipt", limit=50) if r["created_at"] >= day_start])
+        brief = self.latest_brief()
         return {
-            "brief": self.latest_brief(),
+            "brief": brief if brief is None or not keep or keep(brief) else None,
             "decisions": decisions,
             "todos": todos,
             "runs": active + recent,
